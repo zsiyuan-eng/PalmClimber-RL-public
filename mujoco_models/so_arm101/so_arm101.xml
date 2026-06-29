@@ -1,0 +1,90 @@
+<mujoco model="so_arm101">
+  <!-- SO-ARM101 simplified MJCF
+       Based on TheRobotStudio/SO-ARM100, uses STS3215 servos (30kg·cm stall)
+       Mounted on top of the palm tree climber body.
+       Link lengths approximated from real hardware (upper_arm ~14cm, forearm ~13cm, wrist ~7cm)
+  -->
+
+  <asset>
+    <material name="arm_dark"  rgba="0.15 0.15 0.15 1"/>
+    <material name="arm_gray"  rgba="0.45 0.45 0.45 1"/>
+    <material name="arm_white" rgba="0.92 0.92 0.92 1"/>
+    <material name="gripper_mat" rgba="0.2 0.2 0.8 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- arm base is attached as a child body of the climber in scene.xml -->
+    <body name="arm_base" pos="0 0 0">
+      <geom name="arm_base_geom" type="box" size="0.04 0.04 0.025"
+            material="arm_dark" mass="0.18"/>
+
+      <!-- Joint 1: shoulder pan -->
+      <body name="shoulder_pan_link" pos="0 0 0.025">
+        <joint name="joint1_shoulder_pan" type="hinge" axis="0 0 1"
+               range="-3.14159 3.14159" damping="0.5" armature="0.01"/>
+        <geom type="cylinder" size="0.022 0.028" material="arm_dark" mass="0.12"/>
+
+        <!-- Joint 2: shoulder lift -->
+        <body name="shoulder_lift_link" pos="0 0 0.028">
+          <joint name="joint2_shoulder_lift" type="hinge" axis="0 1 0"
+                 range="-1.5708 1.5708" damping="0.5" armature="0.01"/>
+          <geom type="box" size="0.022 0.018 0.07" pos="0 0 0.07"
+                material="arm_gray" mass="0.18"/>
+
+          <!-- Joint 3: elbow -->
+          <body name="upper_arm_link" pos="0 0 0.14">
+            <joint name="joint3_elbow" type="hinge" axis="0 1 0"
+                   range="-2.8 2.8" damping="0.4" armature="0.008"/>
+            <geom type="box" size="0.019 0.016 0.065" pos="0 0 0.065"
+                  material="arm_gray" mass="0.14"/>
+
+            <!-- Joint 4: wrist flex -->
+            <body name="forearm_link" pos="0 0 0.13">
+              <joint name="joint4_wrist_flex" type="hinge" axis="0 1 0"
+                     range="-1.5708 1.5708" damping="0.3" armature="0.005"/>
+              <geom type="box" size="0.016 0.014 0.055" pos="0 0 0.055"
+                    material="arm_white" mass="0.10"/>
+
+              <!-- Joint 5: wrist roll -->
+              <body name="wrist_link" pos="0 0 0.11">
+                <joint name="joint5_wrist_roll" type="hinge" axis="0 0 1"
+                       range="-3.14159 3.14159" damping="0.2" armature="0.003"/>
+                <geom type="cylinder" size="0.014 0.03" material="arm_dark" mass="0.06"/>
+
+                <!-- Joint 6: gripper -->
+                <body name="gripper_base" pos="0 0 0.03">
+                  <geom type="box" size="0.018 0.012 0.015" material="arm_dark" mass="0.04"/>
+
+                  <body name="finger_left" pos="0.012 0 0.015">
+                    <joint name="joint6_gripper" type="slide" axis="1 0 0"
+                           range="0 0.025" damping="0.1"/>
+                    <geom type="box" size="0.005 0.008 0.022" material="gripper_mat" mass="0.01"/>
+                  </body>
+
+                  <body name="finger_right" pos="-0.012 0 0.015">
+                    <joint name="joint6_gripper_mirror" type="slide" axis="-1 0 0"
+                           range="0 0.025" damping="0.1"/>
+                    <geom type="box" size="0.005 0.008 0.022" material="gripper_mat" mass="0.01"/>
+                  </body>
+
+                  <!-- end-effector site for task-space control -->
+                  <site name="ee_site" pos="0 0 0.05" size="0.008" rgba="1 0 0 1"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="act_shoulder_pan"  joint="joint1_shoulder_pan"  gear="50"  ctrlrange="-3.0 3.0"/>
+    <motor name="act_shoulder_lift" joint="joint2_shoulder_lift" gear="80"  ctrlrange="-3.0 3.0"/>
+    <motor name="act_elbow"         joint="joint3_elbow"         gear="60"  ctrlrange="-3.0 3.0"/>
+    <motor name="act_wrist_flex"    joint="joint4_wrist_flex"    gear="30"  ctrlrange="-2.0 2.0"/>
+    <motor name="act_wrist_roll"    joint="joint5_wrist_roll"    gear="20"  ctrlrange="-2.0 2.0"/>
+    <motor name="act_gripper"       joint="joint6_gripper"       gear="5"   ctrlrange="-1.0 1.0"/>
+  </actuator>
+
+</mujoco>
