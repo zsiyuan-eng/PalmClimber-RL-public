@@ -6,15 +6,6 @@ The main idea is combining **Model Predictive Control (MPC)** for stability with
 
 ![robot on tree](assets/robot_photo.jpg)
 
----
-
-## Demo — Escape from Low-Friction Patch
-
-The robot detects a stall, smoothly hands authority from MPC to the RL residual, rotates out of the groove, and resumes climbing. This behavior is never hardcoded — it emerges from reward shaping.
-
-![Escape demo](assets/escape_demo.mp4)
-
----
 
 ## Why MPC + RL?
 
