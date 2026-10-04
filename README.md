@@ -1,279 +1,257 @@
-# PalmBot-MPCRL: Residual RL + MPC for a Tree-Climbing Loco-Manipulation Robot
+# PalmClimber: RL + MPC for Autonomous Tree Care
 
-This is a research project to make a palm tree climbing robot smarter. The hardware was originally built for a robotics competition and uses 6 Dynamixel motors to crawl up tree trunks. We added a SO-ARM101 robot arm on top so it can eventually harvest coconuts or do pruning tasks.
+PalmClimber started as a palm-tree climbing robot built for a robotics competition.
+The original platform used six driven wheels to grip the trunk and climb.
+This project extends that hardware concept into a tree-care system: climb to a
+target, recover when a wheel gets blocked, position an arm, and prune while spraying.
 
-The main idea is combining **Model Predictive Control (MPC)** for stability with **Reinforcement Learning** for adapting to real-world uncertainty (wet bark, different tree diameters, etc.). Training is done in MuJoCo.
+The control system combines **reinforcement learning (RL)** for navigation decisions
+with **model predictive control (MPC)** for continuous motion. We develop and train
+it in MuJoCo, using a single-layer climbing frame and a SO-101-derived arm with an
+integrated scissors/nozzle tool.
 
 ![robot on tree](assets/robot_photo.jpg)
 
+[![Climb, recover, prune and spray](assets/demo.gif)](assets/escape_demo.mp4)
 
-## Why MPC + RL?
+[Watch the 17-second simulation demo](assets/escape_demo.mp4)
 
-Pure MPC works fine if you know the exact friction coefficient of the tree. You don't. Wet bark in Hawaii feels nothing like dry bark, and the model just breaks.
+The demo follows one robot through obstacle contact, recovery, climbing, arm
+extension, realignment, simultaneous pruning/spraying, and withdrawal.
 
-Pure RL is fine too but takes forever to converge for a safety-critical task like this (you don't want the robot sliding down 3 meters mid-episode).
+## Why combine RL and MPC?
 
-The residual RL idea (from [1]) is clean:
+Climbing a tree involves more than tracking a height command. Contact conditions
+change around the trunk, a wheel can meet a raised patch, and motor rotation does
+not always produce upward motion. Extending the arm also changes the load on the
+frame and can move the tool away from a target that was reachable a moment earlier.
 
-```
-u_final = u_MPC + ΔuRL
-```
+MPC is useful for the part we can model: how wheel motion changes height and
+azimuth, how the arm moves, and which actuator and posture limits should be
+respected. It predicts a short motion horizon, applies the first command, and
+solves again using updated feedback. But continuing to track an upward reference
+does not answer the recovery question: **which direction should the robot try
+next, and how far should it turn?**
 
-MPC handles the nominal case and keeps the robot stable. RL only needs to learn a small correction term. In practice this converges 3-4x faster than pure RL and the policy is much more interpretable.
+RL learns that choice from experience. A small turn may clear a narrow obstruction;
+a wider patch or several nearby patches may require a larger turn or a retreat.
+The policy sees the outcome of previous attempts and selects a new local goal.
+MPC then executes that goal within the robot's motion constraints.
 
----
+This division keeps the learning problem focused on navigation and recovery while
+using the robot model for wheel and arm control. The same controller can track
+ordinary climbing requests and recovery requests without learning every actuator
+command as part of one large policy.
 
-## Emergent Behaviors
+## Control architecture
 
-**1. Stuck recovery**
-
-Real palm trees have bark grooves every ~20-30cm. When a wheel drops into one the robot stalls — motors spin but height doesn't change. We don't write an explicit "if stuck → turn" rule. Instead:
-
-- The 29D actor observation includes `stuck_counter`, `height_gain_rate`, current normalized `u_mpc`, stuck-gated authority terms, azimuth sin/cos, azimuth rate, and the previous magic lateral command
-- When progress stalls under upward MPC commands, `stuck_level` ramps smoothly over ~0.4s: MPC authority drops and RL residual authority increases so the policy can command descent/oscillation/escape motions
-- After rotation, it returns to uniform upward speed
-
-In simulation, stuck regions are local height/azimuth patches, not full-ring bands. Each wheel checks its MuJoCo world position against these patches, so only the wheels touching that local patch lose traction.
-
-**2. Target-aware rotation**
-
-There's a leaf/pruning target placed at a random azimuth (0-360°) and height (1.6-2.4m). The observation includes `azimuth_error`, and the reward penalises misalignment when the robot is near the target height. The agent learns to simultaneously climb and yaw, arriving at the right height already oriented correctly.
-
----
-
-## System Overview
-
-```
-┌─────────────────────────────────────────────────────┐
-│              Task Planner (user / high-level RL)    │
-│         target_height, arm_target_pose              │
-└──────────────┬──────────────────────────────────────┘
-               │
-   ┌───────────┴────────────┐
-   │                        │
-┌──▼──────────────┐  ┌──────▼──────────┐
-│  Climbing MPC   │  │  Arm Policy     │
-│  (casadi/ipopt) │  │  SAC, SB3       │
-│                 │  │                 │
-│  state: h,v,θ   │  │  SO-ARM101 6DOF │
-│  output: u_mpc  │  │  → ee to target │
-└──────┬──────────┘  └────────────────┘
-       │
-┌──────▼──────────┐
-│  Residual PPO   │
-│  ΔuRL ← f(obs)  │
-└──────┬──────────┘
-       │
-┌──────▼──────────────────────┐
-│   MuJoCo Sim / Real Robot   │
-│   6x Dynamixel + MPU-6050   │
-│   Arduino + Serial (50Hz)   │
-└─────────────────────────────┘
+```mermaid
+flowchart LR
+    S[Motion feedback] --> H[Attempt memory]
+    H --> P[PPO policy]
+    G[Task goal] --> P
+    P --> W[Local height and turn request]
+    W --> M[MPC]
+    I[Arm inverse kinematics] --> M
+    M --> A[Wheel and arm commands]
+    A --> R[MuJoCo robot]
+    R --> S
 ```
 
----
+| Component | Responsibility |
+|---|---|
+| PPO policy | Choose climb, hold, retreat, and the direction and size of a turn |
+| Attempt memory | Record measured progress and unsuccessful requests near the current pose |
+| MPC | Track local goals with limits on base motion, wheel commands, arm motion, and passive tilt |
+| Inverse kinematics | Update arm joint targets from the current base pose and tool target |
+| Task stages | Sequence arrival, extension, realignment, tool operation, and withdrawal |
 
-## Results (simulation, 1M training steps)
+The actor is a feedforward network:
 
-Training uses 4 parallel MuJoCo environments. Local low-friction patches are randomized each episode by height, azimuth, angular width, and severity. Leaf target azimuth and height are also randomized.
-
-**Reward curve** — policy improves steadily as it learns to stay upright and climb efficiently:
-
-![reward curve](assets/reward_curve.png)
-
-**Escape success rate** — escape behavior emerges around 850k steps and peaks at ~15% near 975k steps:
-
-![success rate](assets/success_rate.png)
-
----
-
-## Pretrained Checkpoint
-
-The `checkpoints/` folder contains the policy saved near the escape-success peak (~1M steps):
-
-| File | Description |
-|------|-------------|
-| `checkpoints/ppo_1M.zip` | PPO policy weights |
-| `checkpoints/vec_normalize_1M.pkl` | VecNormalize observation statistics |
-
-Load and run in simulation:
-
-```python
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from envs.tree_climber_env import TreeClimberEnv
-
-env = DummyVecEnv([lambda: TreeClimberEnv()])
-env = VecNormalize.load("checkpoints/vec_normalize_1M.pkl", env)
-env.training = False
-env.norm_reward = False
-
-model = PPO.load("checkpoints/ppo_1M.zip", env=env)
-
-obs = env.reset()
-for _ in range(1000):
-    action, _ = model.predict(obs, deterministic=True)
-    obs, _, done, _ = env.step(action)
-    if done:
-        obs = env.reset()
+```text
+313 observations → 256 Tanh → 256 Tanh → 21 action logits
 ```
 
----
+A separate value network uses the same hidden-layer sizes and produces one value
+estimate. The observation combines motion feedback, the task goal, recent commands,
+and explicit attempt history. The memory is maintained by the environment and
+supplied to the network as features.
 
-## Hardware
+The 21 actions combine hold/climb/retreat with turns in either direction at three
+amplitudes: 0.07, 0.20, and 0.42 radians. They request local waypoints; the distance
+actually traveled depends on contact dynamics and the MPC limits. After arrival,
+the arm sequence runs through inverse kinematics and MPC.
 
-- **Climbing body**: 6x Dynamixel MX-28, ring circumference ~1.2m, 2 clamping rings
-- **Arm**: SO-ARM101 (5 DOF + gripper), STS3215 servos, mounted on top of the frame
-- **IMU**: MPU-6050 on the Arduino (pitch/roll at 50Hz)
-- **Controller**: Arduino Mega + DynamixelShield
-- **PC**: any laptop running Python, connected via USB-Serial
+## Learning to recover from blocked motion
 
-The MuJoCo model approximates the real geometry as faithfully as we could without CAD files. Tree trunk radius = 0.12m, robot ring outer radius ~0.19m.
+An obstacle is first encountered through its effect on motion. The robot attempts
+to climb, but height gain falls while encoder motion, slip, or a motor-load proxy
+indicates that the request is not working. The policy uses that feedback to decide
+whether to keep climbing, turn, hold, or move down before trying another route.
 
----
+Attempt memory records what was requested and what actually happened in the nearby
+height/azimuth region. This helps distinguish an untried action from one that has
+already failed in a similar context. The reward penalizes repeated unsuccessful
+requests and unproductive direction reversals, so spending time on the same
+blocked maneuver has a cost.
+
+Obstacles have different widths and appear at several heights. Recovery therefore
+requires more than one universal turn angle. The full six-wheel footprint matters:
+moving one tire clear is not enough if another tire still meets the obstruction.
+MuJoCo resolves contact between the tire/roller geometries and the visible obstacle
+facets. Obstacle coordinates are used to build the physical scene; the navigation
+policy makes its decisions from feedback and attempt history.
+
+## From climbing to pruning and spraying
+
+The mission runs on one robot with one integrated tool:
+
+1. **Climb and recover.** Reach the target height and azimuth, changing local
+   navigation requests when contact prevents progress.
+2. **Extend.** Bring the folded arm toward the target while monitoring the passive
+   response of the climbing frame.
+3. **Realign.** Recompute the tool alignment using the current base pose. Arm
+   extension can tilt the frame, so the original alignment may no longer hold.
+4. **Operate.** Close the scissors with the nozzle active once the alignment and
+   motion gates are satisfied.
+5. **Withdraw.** Retract the arm and return to a folded posture.
+
+The base has no independent leveling actuator. Roll and pitch are passive states;
+the controller accounts for them when selecting a reachable arm posture and
+checking motion limits. Available base corrections are climbing and rotation
+around the trunk. There is no command that simply resets the frame to level.
+
+The navigation policy is trained. Arm positioning, task transitions, and tool
+activation use model-based control and explicit task conditions. Cutting is a
+simulated jaw/target event, and spraying uses a coverage model.
+
+## Robot and simulation
+
+| Part | Model |
+|---|---|
+| Climbing base | One planar frame with six driven omni wheels |
+| Base motion | Vertical climbing and rotation around the trunk |
+| Frame attitude | Passive roll and pitch under contact and arm loading |
+| Arm | SO-101 CAD with a custom sixth positioning axis |
+| Tool | Scissors and nozzle on the same end effector |
+| Environment | MuJoCo trunk contact, raised obstacle facets, and leaf targets |
+
+The photo shows the competition prototype; the video shows the simulated system.
+The simulation retains the single-layer frame and six-wheel arrangement. Arm
+geometry comes from SO-101 meshes, with project modifications for the extra axis
+and combined tool. Asset attribution and licensing are in the
+[model notice](mujoco_models/so101/NOTICE.md).
+
+## Training
+
+Training uses PPO with parallel Gymnasium environments. Episodes vary obstacle
+placement and width, trunk friction, payload, and the starting and target poses.
+A curriculum begins with simpler encounters and progresses to multiple obstacle
+patches. Some episodes have no obstacles, keeping ordinary climbing in the task.
+
+The reward favors new height progress and progress toward the task goal. It also
+charges for elapsed time, repeated failed attempts, prolonged lack of progress,
+unproductive reversals, excessive yaw travel, slip, and load. Arrival gives a
+completion reward; an unsafe outcome gives a penalty.
+
+The curve below shows mean validation reward during navigation pretraining from
+random initialization.
+
+![Training reward](assets/reward_curve.png)
+
+The default training budget is 524,288 policy decisions across four environments.
+Each environment collects 512 decisions per rollout. PPO uses eight optimization
+epochs, a 0.20 clipping range, and a 0.995 discount factor.
+
+Observation and reward normalization are enabled during training. Validation uses
+fixed scenes with frozen observation statistics and raw rewards. Checkpoint
+selection prioritizes successful arrivals, then measured effort, then reward.
+Each saved policy is paired with its normalization statistics and metadata.
+
+## MPC formulation
+
+The prediction state contains base height, azimuth, passive roll/pitch, six arm
+joint positions, and their velocities: 20 values in total. The optimizer chooses
+two generalized base inputs and six arm velocity requests.
+
+At each solve, the controller linearizes the motion model locally:
+
+$$x_{k+1} = A_k x_k + B_k u_k + c_k$$
+
+In compact form, the objective combines state tracking, tool-pose error during
+realignment/operation, and input effort around the holding command:
+
+$$\min_{u_{0:N-1}} \sum_{k=0}^{N-1}
+\left(\|x_k-x_k^{ref}\|_Q^2 + \|e_k^{tool}\|_W^2
++ \|u_k-u_k^{hold}\|_R^2\right)$$
+
+Constraints cover base speed, joint range and speed, wheel capability, and passive
+tilt. Roll and pitch have no leveling objective. The default navigation setup uses
+a four-step prediction horizon with a 0.12-second prediction interval. Wheel
+mixing maps the base request to six shaft commands, including alternating
+directions for rotation around the tree.
 
 ## Quickstart
 
+Run these commands from the repository root using Python 3.10 or newer.
+
+### Install dependencies
+
 ```bash
-git clone https://github.com/zsiyuan-eng/PalmClimber-RL.git
-cd PalmClimber-RL
 pip install -r requirements.txt
 ```
 
-### View the MuJoCo model
+### Train a navigation policy
 
 ```bash
-python -m mujoco.viewer mujoco_models/scene.xml
+python -m rl.train_navigation \
+    --output runs/train \
+    --timesteps 524288 \
+    --n-envs 4
 ```
 
-### Train climbing policy
+Training writes rewards, validation results, and paired checkpoints under the
+chosen output directory. `--config` accepts a JSON configuration; `--device` selects
+the policy device. Outputs are excluded from version control by default.
+
+### Evaluate the complete task
 
 ```bash
-python rl/train_climber.py --n-envs 4
+python -m scripts.evaluate_navigation \
+    --policy runs/train/checkpoints/best_model.zip \
+    --episodes 3 \
+    --complete-task
 ```
 
-Add `--no-mpc` to train a pure RL baseline for comparison. Default: 1M timesteps.
+Evaluation runs fresh obstacle worlds and writes results to `runs/evaluation`.
+Omit `--complete-task` to evaluate navigation alone. Keep the policy's matching
+`.vecnormalize.pkl` and `.json` files alongside its `.zip` checkpoint.
 
-### Evaluate escape policy
+## Project layout
 
-```bash
-python scripts/evaluate_escape_policy.py --model checkpoints/ppo_1M.zip \
-    --vec-normalize checkpoints/vec_normalize_1M.pkl --n-episodes 100
+```text
+assets/                      Photo, demo, and training curve
+envs/
+  navigation_env.py          PPO environment with native obstacle contacts
+  navigation_base.py         Waypoint actions and navigation reward
+  contact_env.py             Tire/roller collision scene
+  tree_work_env.py           Arm, tool, and complete-task simulation
+mpc/
+  controller.py              Predictive base and arm control
+  memory.py                  Persistent attempt outcomes
+  sensor_memory.py           Motion-feedback history
+rl/
+  train_navigation.py        PPO training and checkpoint selection
+  policy.py                  Policy loading and normalization
+scripts/
+  evaluate_navigation.py     Navigation and full-task evaluation
+mujoco_models/               Robot model, SO-101 meshes, and license
 ```
 
-### Record a demo video
+## Hardware transfer
 
-```bash
-python scripts/record_escape_demo_video.py --model checkpoints/ppo_1M.zip \
-    --vec-normalize checkpoints/vec_normalize_1M.pkl
-```
-
-### Deploy on real robot
-
-Flash `deploy/firmware_mpcrl.ino` to the Arduino, then:
-
-```bash
-python deploy/run_policy.py --port COM12 --target-height 2.0
-```
-
-For manual keyboard control:
-```bash
-python deploy/teleop.py
-```
-
----
-
-## Repo Structure
-
-```
-PalmClimber-RL/
-├── assets/
-│   ├── robot_photo.jpg
-│   ├── escape_demo.mp4       ← demo video
-│   ├── reward_curve.png      ← training reward (1M steps)
-│   └── success_rate.png      ← escape success rate (1M steps)
-├── checkpoints/
-│   ├── ppo_1M.zip            ← pretrained policy (~1M steps)
-│   └── vec_normalize_1M.pkl  ← observation normalization stats
-├── mujoco_models/
-│   ├── scene.xml             ← training scene (tree + base-only visual robot)
-│   ├── tree_climber.xml      ← robot body only
-│   └── so_arm101/            ← SO-ARM101 MJCF (simplified)
-├── envs/
-│   ├── tree_climber_env.py   ← Gymnasium env, MPC-RL interface
-│   └── arm_env.py            ← arm reach env (legacy)
-├── mpc/
-│   └── climbing_mpc.py       ← CasADi MPC, 6-state model, 20-step horizon
-├── rl/
-│   ├── train_climber.py      ← PPO residual training
-│   ├── train_arm.py          ← SAC arm training (legacy)
-│   ├── train_escape_expert.py← expert BC + fine-tuning for escape behavior
-│   ├── collect_escape_expert.py
-│   └── residual_agent.py     ← custom feature extractor with LayerNorm
-├── deploy/
-│   ├── run_policy.py         ← load model + serial loop (50Hz)
-│   ├── firmware_mpcrl.ino    ← Arduino firmware (numeric velocity cmds)
-│   ├── firmware_wasd.ino     ← original WASD teleop firmware
-│   └── teleop.py             ← keyboard teleoperation
-└── scripts/
-    ├── evaluate_escape_policy.py
-    └── record_escape_demo_video.py
-```
-
----
-
-## MPC Formulation
-
-The nominal climbing model:
-
-$$\mathbf{x} = [h,\ \dot{h},\ \theta_x,\ \dot\theta_x,\ \theta_y,\ \dot\theta_y]^\top$$
-
-Slip/traction approximation:
-
-$$v_i = r_w u_i,\quad s_i = v_i - \dot{h}$$
-
-$$F_i = F_{max}\tanh(K_{slip}s_i/F_{max}),\quad F_{max}=\mu N_i$$
-
-$$\ddot{h} = \frac{\sum_i F_i - mg - b\dot{h}}{m}$$
-
-where $\mu=0.70$ is nominal friction, $r_w=0.025$m. The MPC solves a 20-step horizon NLP at each step:
-
-$$\min_{\mathbf{u}_{0:N-1}} \sum_{k=0}^{N-1} \|\mathbf{x}_k - \mathbf{x}_{ref}\|_Q^2 + \|\mathbf{u}_k\|_R^2$$
-
-with wheel speed limits $|u_i| \leq 22$ rad/s. The RL residual is combined through a stuck-gated authority mechanism:
-
-$$\mathbf{u}_{final} = w_{mpc}\mathbf{u}_{mpc} + s_{rl}\pi_\theta(\mathbf{x}, \mathbf{u}_{mpc})$$
-
-When progress stalls, $w_{mpc}$ smoothly decreases toward 0.2 and $s_{rl}$ increases from 4 to 20, giving the policy enough authority for recovery. Normal climbing remains MPC-dominant.
-
----
-
-## Notes / Known Issues
-
-- The MJCF wheel-tree contact is finicky. If the robot falls immediately on reset, try bumping the `solimp` values in `scene.xml` or increasing `friction` on the trunk geoms.
-- CasADi IPOPT sometimes hits iteration limits on the first few steps of an episode. The env catches solver failures and falls back to a P controller.
-- The height estimator in the Arduino firmware integrates wheel speed only. A proper estimate needs encoder feedback + IMU fusion.
-- SO-ARM101 in the model is a geometric approximation. The real STS3215 servos have different torque curves; gains will need tuning for real deployment.
-
----
-
-## References
-
-[1] Johannink et al., "Residual Reinforcement Learning for Robot Control", ICRA 2019.
-
-[2] Rawlings et al., "Model Predictive Control: Theory, Computation, and Design", 2017.
-
-[3] TheRobotStudio, SO-ARM100: https://github.com/TheRobotStudio/SO-ARM100
-
-[4] Todorov et al., "MuJoCo: A physics engine for model-based control", IROS 2012.
-
----
-
-## TODO
-
-- [ ] sim-to-real: measure real friction on actual palm trees
-- [ ] height sensing: add ToF sensor or encoder odometry on real hardware
-- [ ] arm training: train SO-ARM101 reach policy and re-integrate into the main scene
-- [ ] full loco-manipulation pipeline: combine climbing policy + arm policy into a single end-to-end task (climb → align → reach)
-
-PRs welcome.
+The next step is to connect the simulated controller to the competition platform's
+sensor and motor interfaces. That requires calibrating wheel motion and traction,
+measuring height and azimuth reliably, and validating the arm-load model against
+the physical frame. The current learning curve and mission demo are simulation
+results; hardware evaluation remains a separate part of the project.
