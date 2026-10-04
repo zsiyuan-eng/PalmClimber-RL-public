@@ -45,18 +45,7 @@ command as part of one large policy.
 
 ## Control architecture
 
-```mermaid
-flowchart LR
-    S[Motion feedback] --> H[Attempt memory]
-    H --> P[PPO policy]
-    G[Task goal] --> P
-    P --> W[Local height and turn request]
-    W --> M[MPC]
-    I[Arm inverse kinematics] --> M
-    M --> A[Wheel and arm commands]
-    A --> R[MuJoCo robot]
-    R --> S
-```
+![Control architecture](assets/control_architecture.png)
 
 | Component | Responsibility |
 |---|---|
